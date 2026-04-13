@@ -1307,7 +1307,11 @@ const DEFAULT = {
 };
 
 // ═══════════ FIREBASE SETUP ═══════════
-let _db, _cmsRef;
+// Split data into chunks to avoid Firebase 1MB document limit
+// Docs: wms/cms (text+settings), wms/products, wms/media (images)
+let _db, _fbGetDoc, _fbSetDoc;
+let _refCms, _refProducts, _refMedia;
+
 async function initFirebase(){
   const { initializeApp } = await import("https://www.gstatic.com/firebasejs/12.12.0/firebase-app.js");
   const { getFirestore, doc, getDoc, setDoc } = await import("https://www.gstatic.com/firebasejs/12.12.0/firebase-firestore.js");
@@ -1320,18 +1324,39 @@ async function initFirebase(){
     appId: "1:837145270623:web:eeac20aa0a18fab4fbfeea"
   });
   _db = getFirestore(_fbApp);
-  _cmsRef = doc(_db, 'wms', 'cms');
-  window._fbGetDoc = getDoc;
-  window._fbSetDoc = setDoc;
+  _fbGetDoc = getDoc;
+  _fbSetDoc = setDoc;
+  // Three separate docs to stay under 1MB limit each
+  _refCms      = doc(_db, 'wms', 'cms');      // settings, text, categories, coupons etc
+  _refProducts = doc(_db, 'wms', 'products'); // product list (can be large with base64 imgs)
+  _refMedia    = doc(_db, 'wms', 'media');    // section media: hero/banner/about images
 }
 
 // ═══════════ STATE ═══════════
 let CMS, cart=[], appliedCoupon=null, currentCat="All", currentSubCat="", mProd=null, mQty=1, currentPage="home";
 
 // ═══════════ SAVE ═══════════
+// Splits CMS into 3 docs so no single doc exceeds 1MB
 async function save(){
-  try { if(_cmsRef && window._fbSetDoc) await window._fbSetDoc(_cmsRef, {data: JSON.stringify(CMS)}); } catch(e){}
+  // Always save to localStorage as instant backup
   localStorage.setItem('wms_cms', JSON.stringify(CMS));
+  if(!_refCms) return;
+  try {
+    // Doc 1: everything except products and sectionMedia (small)
+    const cmsSlice = {};
+    Object.keys(CMS).forEach(k => {
+      if(k !== 'products' && k !== 'sectionMedia') cmsSlice[k] = CMS[k];
+    });
+    await _fbSetDoc(_refCms, { data: JSON.stringify(cmsSlice), adminToken: "WMS_WILSON2025_SECURE" });
+
+    // Doc 2: products only (may contain base64 images per product)
+    await _fbSetDoc(_refProducts, { data: JSON.stringify(CMS.products || []), adminToken: "WMS_WILSON2025_SECURE" });
+
+    // Doc 3: section media only (hero/banner/about base64 images)
+    await _fbSetDoc(_refMedia, { data: JSON.stringify(CMS.sectionMedia || {}), adminToken: "WMS_WILSON2025_SECURE" });
+  } catch(e){
+    console.warn('Firebase save error:', e.message);
+  }
 }
 function saveCart(){ localStorage.setItem('wms_cart', JSON.stringify(cart)); }
 
@@ -1339,14 +1364,31 @@ function saveCart(){ localStorage.setItem('wms_cart', JSON.stringify(cart)); }
 async function load(){
   try {
     await initFirebase();
-    const snap = await window._fbGetDoc(_cmsRef);
-    if(snap.exists() && snap.data().data){
-      CMS = JSON.parse(snap.data().data);
+    // Fetch all 3 docs in parallel for speed
+    const [snapCms, snapProds, snapMedia] = await Promise.all([
+      _fbGetDoc(_refCms),
+      _fbGetDoc(_refProducts),
+      _fbGetDoc(_refMedia)
+    ]);
+
+    if(snapCms.exists() && snapCms.data().data){
+      // Merge all 3 docs back into one CMS object
+      CMS = JSON.parse(snapCms.data().data);
+      CMS.products    = snapProds.exists() && snapProds.data().data  ? JSON.parse(snapProds.data().data)  : [];
+      CMS.sectionMedia= snapMedia.exists() && snapMedia.data().data  ? JSON.parse(snapMedia.data().data)  : DEFAULT.sectionMedia;
     } else {
+      // First time setup — push defaults to all 3 docs
       CMS = JSON.parse(JSON.stringify(DEFAULT));
-      await window._fbSetDoc(_cmsRef, {data: JSON.stringify(CMS)});
+      const cmsSlice = {};
+      Object.keys(CMS).forEach(k => { if(k !== 'products' && k !== 'sectionMedia') cmsSlice[k] = CMS[k]; });
+      await Promise.all([
+        _fbSetDoc(_refCms,      { data: JSON.stringify(cmsSlice),          adminToken: "WMS_WILSON2025_SECURE" }),
+        _fbSetDoc(_refProducts, { data: JSON.stringify(CMS.products),      adminToken: "WMS_WILSON2025_SECURE" }),
+        _fbSetDoc(_refMedia,    { data: JSON.stringify(CMS.sectionMedia),  adminToken: "WMS_WILSON2025_SECURE" }),
+      ]);
     }
   } catch(e){
+    console.warn('Firebase load error, using localStorage:', e.message);
     const s = localStorage.getItem('wms_cms');
     CMS = s ? JSON.parse(s) : JSON.parse(JSON.stringify(DEFAULT));
   }
